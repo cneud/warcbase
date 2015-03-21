@@ -1,11 +1,14 @@
 package org.warcbase.ingest;
 
-import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.zip.GZIPInputStream;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Iterator;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -14,20 +17,22 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.io.IOUtils;
+import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.log4j.Logger;
-import org.jwat.arc.ArcReader;
-import org.jwat.arc.ArcReaderFactory;
-import org.jwat.arc.ArcRecordBase;
-import org.jwat.common.ByteCountingPushBackInputStream;
-import org.jwat.common.HttpHeader;
-import org.jwat.common.Payload;
-import org.jwat.common.UriProfile;
-import org.jwat.warc.WarcReader;
-import org.jwat.warc.WarcReaderFactory;
-import org.jwat.warc.WarcRecord;
-import org.warcbase.data.HbaseManager;
-import org.warcbase.data.Util;
+import org.archive.io.ArchiveRecord;
+import org.archive.io.ArchiveRecordHeader;
+import org.archive.io.arc.ARCReader;
+import org.archive.io.arc.ARCReaderFactory;
+import org.archive.io.arc.ARCRecord;
+import org.archive.io.arc.ARCRecordMetaData;
+import org.archive.io.warc.WARCConstants;
+import org.archive.io.warc.WARCReader;
+import org.archive.io.warc.WARCReaderFactory; 
+import org.archive.io.warc.WARCRecord; 
+import org.archive.util.ArchiveUtils;
+import org.warcbase.data.HBaseTableManager;
+import org.warcbase.data.UrlUtils;
+import org.warcbase.data.WarcRecordUtils;
 
 public class IngestFiles {
   private static final String CREATE_OPTION = "create";
@@ -35,164 +40,206 @@ public class IngestFiles {
   private static final String NAME_OPTION = "name";
   private static final String DIR_OPTION = "dir";
   private static final String START_OPTION = "start";
+  private static final String GZ_OPTION = "gz";
+  private static final String MAX_CONTENT_SIZE_OPTION = "maxSize";
 
   private static final Logger LOG = Logger.getLogger(IngestFiles.class);
-  // TODO: rename to constants and make final
-  private static final UriProfile uriProfile = UriProfile.RFC3986_ABS_16BIT_LAX;
-  private static final boolean bBlockDigestEnabled = true;
-  private static final boolean bPayloadDigestEnabled = true;
-  private static final int recordHeaderMaxSize = 8192;
-  private static final int payloadHeaderMaxSize = 32768;
 
-  public static final int MAX_CONTENT_SIZE = 1024 * 1024;
+  private static final DateFormat iso8601 = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssX");
+
+  public static int MAX_CONTENT_SIZE = 10 * 1024 * 1024;
 
   private int cnt = 0;
-  private int skipped = 0;
+  private int errors = 0;
+  private int toolarge = 0;
+  private int invalidUrls = 0;
 
-  private final HbaseManager hbaseManager;
+  private final HBaseTableManager hbaseManager;
 
-  public IngestFiles(String name, boolean create) throws Exception {
-    hbaseManager = new HbaseManager(name, create);
+  public IngestFiles(String name, boolean create, Compression.Algorithm compression) throws Exception {
+    hbaseManager = new HBaseTableManager(name, create, compression);
   }
 
-  private void ingestArcFile(File inputArcFile) throws IOException {
-    ArcRecordBase record = null;
-    String url = null;
-    String date = null;
-    byte[] content = null;
-    String type = null;
-    String key = null;
+  protected final byte [] scratchbuffer = new byte[4 * 1024];
 
-    InputStream in = new FileInputStream(inputArcFile);
-    ArcReader reader = ArcReaderFactory.getReader(in);
-    while ((record = reader.getNextRecord()) != null) {
-      try {
-        url = record.getUrlStr();
-        date = record.getArchiveDateStr();
-        content = IOUtils.toByteArray(record.getPayloadContent());
-        key = Util.reverseHostname(url);
-        type = record.getContentTypeStr();
+  protected long copyStream(final InputStream is, final long recordLength,
+      boolean enforceLength, final DataOutputStream out) throws IOException {
+    int read = scratchbuffer.length;
+    long tot = 0;
+    while ((tot < recordLength) && (read = is.read(scratchbuffer)) != -1) {
+      int write = read;
+      // never write more than enforced length
+      write = (int) Math.min(write, recordLength - tot);
+      tot += read;
+      out.write(scratchbuffer, 0, write);
+    }
+    if (enforceLength && tot != recordLength) {
+      LOG.error("Read " + tot + " bytes but expected " + recordLength + " bytes. Continuing...");
+    }
 
-        if (key != null && type == null) {
+    return tot;
+  }
+
+  private void ingestArcFile(File inputArcFile) {
+    ARCReader reader = null;
+
+    // Per file trapping of exceptions so a corrupt file doesn't blow up entire ingest.
+    try {
+      reader = ARCReaderFactory.get(inputArcFile);
+
+      // The following snippet of code was adapted from the dump method in ARCReader.
+      boolean firstRecord = true;
+      for (Iterator<ArchiveRecord> ii = reader.iterator(); ii.hasNext();) {
+        ARCRecord r = (ARCRecord) ii.next();
+        ARCRecordMetaData meta = r.getMetaData();
+        if (firstRecord) {
+          firstRecord = false;
+          while (r.available() > 0) {
+            r.read();
+          }
+          continue;
+        }
+
+        if (meta.getUrl().startsWith("dns:")) {
+            invalidUrls++;
+            continue;
+        }
+
+        String metaline = meta.getUrl() + " " + meta.getIp() + " " + meta.getDate() + " "
+            + meta.getMimetype() + " " + (int) meta.getLength();
+
+        String date = meta.getDate();
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream dout = new DataOutputStream(baos);
+        dout.write(metaline.getBytes());
+        dout.write("\n".getBytes());
+        copyStream(r, (int) meta.getLength(), true, dout);
+
+        String key = UrlUtils.urlToKey(meta.getUrl());
+        String type = meta.getMimetype();
+
+        if (key == null) {
+          LOG.error("Invalid URL: " + meta.getUrl());
+          invalidUrls++;
+          continue;
+        }
+
+        if (type == null) {
           type = "text/plain";
         }
 
-        if (key == null) {
-          continue;
-        }
-
-        if (content.length > MAX_CONTENT_SIZE) {
-          skipped++;
+        if ((int) meta.getLength() > MAX_CONTENT_SIZE) {
+          toolarge++;
         } else {
-          if (cnt % 10000 == 0 && cnt > 0) {
-            LOG.info("Ingested " + cnt + " records into Hbase.");
-          }
-          if (hbaseManager.addRecord(key, date, content, type)) {
+          if (hbaseManager.insertRecord(key, date, baos.toByteArray(), type)) {
             cnt++;
           } else {
-            skipped++;
+            errors++;
           }
         }
-      } catch (Exception e) {
-        LOG.error("Error ingesting record: " + e);
-      }
-    }
 
-    reader.close();
-    in.close();
+        if (cnt % 10000 == 0 && cnt > 0) {
+          LOG.info("Ingested " + cnt + " records into HBase.");
+        }
+      }
+    } catch (Exception e) {
+      LOG.error("Error ingesting file: " + inputArcFile);
+      e.printStackTrace();
+    } catch (OutOfMemoryError e) {
+      LOG.error("Encountered OutOfMemoryError ingesting file: " + inputArcFile);
+      LOG.error("Attempting to continue...");
+    } finally {
+      if (reader != null)
+        try {
+          reader.close();
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
+    }
   }
 
-  private void ingestWarcFile(File inputWarcFile) throws IOException {
-    WarcRecord warcRecord = null;
-    String uri = null;
-    String date = null;
-    String type = null;
-    byte[] content = null;
-    String key = null;
+  private void ingestWarcFile(File inputWarcFile) {
+    WARCReader reader = null;
 
-    GZIPInputStream gzInputStream = new GZIPInputStream(new FileInputStream(inputWarcFile));
-    ByteCountingPushBackInputStream pbin = new ByteCountingPushBackInputStream(
-        new BufferedInputStream(gzInputStream, 8192), 32);
-    WarcReader warcReader = WarcReaderFactory.getReaderUncompressed(pbin);
+    // Per file trapping of exceptions so a corrupt file doesn't blow up entire ingest.
+    try {
+      reader = WARCReaderFactory.get(inputWarcFile);
 
-    if (warcReader == null) {
-      LOG.info("Can't read warc file " + inputWarcFile.getName());
-      return;
-    }
+      // The following snippet of code was adapted from the dump method in ARCReader.
+      boolean firstRecord = true;
+      for (Iterator<ArchiveRecord> ii = reader.iterator(); ii.hasNext();) {
+        WARCRecord r = (WARCRecord) ii.next();
+	ArchiveRecordHeader h = r.getHeader();
+        byte[] recordBytes = WarcRecordUtils.toBytes(r);
+        byte[] content = WarcRecordUtils.getContent(WarcRecordUtils.fromBytes(recordBytes));
 
-    warcReader.setWarcTargetUriProfile(uriProfile);
-    warcReader.setBlockDigestEnabled(bBlockDigestEnabled);
-    warcReader.setPayloadDigestEnabled(bPayloadDigestEnabled);
-    warcReader.setRecordHeaderMaxSize(recordHeaderMaxSize);
-    warcReader.setPayloadHeaderMaxSize(payloadHeaderMaxSize);
-
-    while ((warcRecord = warcReader.getNextRecord()) != null) {
-      uri = warcRecord.header.warcTargetUriStr;
-      key = Util.reverseHostname(uri);
-      Payload payload = warcRecord.getPayload();
-      HttpHeader httpHeader = null;
-      InputStream payloadStream = null;
-
-      if (payload == null) {
-        continue;
-      }
-
-      httpHeader = warcRecord.getHttpHeader();
-      if (httpHeader != null) {
-        payloadStream = httpHeader.getPayloadInputStream();
-        type = httpHeader.contentType;
-      } else {
-        payloadStream = payload.getInputStreamComplete();
-      }
-
-      if (payloadStream == null) {
-        skipped++;
-        continue;
-      }
-
-      date = warcRecord.header.warcDateStr;
-
-      if (payloadStream.available() > MAX_CONTENT_SIZE) {
-        skipped++;
-        continue;
-      }
-      content = IOUtils.toByteArray(payloadStream);
-      // TODO: fix this
-      if (key == null) {
-        skipped++;
-        continue;
-      }
-
-      if (type == null) {
-        type = "text/plain";
-      }
-
-      if (warcRecord.getHeader("WARC-Type").value.toLowerCase().equals("response")) {
-        if (content.length > MAX_CONTENT_SIZE) {
-          skipped++;
+        if (firstRecord) {
+          firstRecord = false;
+          while (r.available() > 0) {
+            r.read();
+          }
           continue;
         }
-        if (cnt % 10000 == 0 && cnt > 0) {
-          LOG.info("Ingested " + cnt + " records into Hbase.");
+
+        // Only store WARC 'response' records
+        // Would it be useful to store 'request' and 'metadata' records too?
+        if (!h.getHeaderValue(WARCConstants.HEADER_KEY_TYPE).equals("response")) {
+            continue;
         }
-        if (hbaseManager.addRecord(key, date, content, type)) {
-          cnt++;
+
+        if (h.getUrl().startsWith("dns:")) {
+            invalidUrls++;
+            continue;
+        }
+
+        Date d = iso8601.parse(h.getDate());
+        String date = ArchiveUtils.get14DigitDate(d);
+       
+        String key = UrlUtils.urlToKey(h.getUrl()); 
+        String type = WarcRecordUtils.getWarcResponseMimeType(content);
+
+        if (key == null) {
+          LOG.error("Invalid URL: " + h.getUrl());
+          invalidUrls++;
+          continue;
+        }
+
+        if (type == null) {
+          type = "text/plain";
+        }
+
+        if ((int) h.getLength() > MAX_CONTENT_SIZE) {
+          toolarge++;
         } else {
-          skipped++;
+          if (hbaseManager.insertRecord(key, date, recordBytes, type)) {
+            cnt++;
+          } else {
+            errors++;
+          }
+        }
+
+        if (cnt % 10000 == 0 && cnt > 0) {
+          LOG.info("Ingested " + cnt + " records into HBase.");
         }
       }
+    } catch (Exception e) {
+      LOG.error("Error ingesting file: " + inputWarcFile);
+      e.printStackTrace();
+    } catch (OutOfMemoryError e) {
+      LOG.error("Encountered OutOfMemoryError ingesting file: " + inputWarcFile);
+      LOG.error("Attempting to continue...");
+    } finally {
+      if (reader != null)
+        try {
+          reader.close();
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
     }
-
-    warcReader.close();
-    pbin.close();
-    gzInputStream.close();
   }
 
-  private void ingestFolder(File inputFolder, int i) throws IOException {
+  private void ingestFolder(File inputFolder, int i) throws Exception {
     long startTime = System.currentTimeMillis();
-    cnt = 0;
-    skipped = 0;
-    GZIPInputStream gzInputStream = null;
 
     for (; i < inputFolder.listFiles().length; i++) {
       File inputFile = inputFolder.listFiles()[i];
@@ -203,19 +250,15 @@ public class IngestFiles {
 
       LOG.info("processing file " + i + ": " + inputFile.getName());
 
-      if (inputFile.toString().toLowerCase().endsWith(".gz")) {
-        gzInputStream = new GZIPInputStream(new FileInputStream(inputFile));
-        ByteCountingPushBackInputStream in = new ByteCountingPushBackInputStream(gzInputStream, 32);
-        if (ArcReaderFactory.isArcFile(in)) {
-          ingestArcFile(inputFile);
-        } else if (WarcReaderFactory.isWarcFile(in)) {
-          ingestWarcFile(inputFile);
-        }
+      if ( inputFile.getName().endsWith(".warc.gz") || inputFile.getName().endsWith(".warc") ) {
+        ingestWarcFile(inputFile);
+      } else if (inputFile.getName().endsWith(".arc.gz") || inputFile.getName().endsWith(".arc")) {
+        ingestArcFile(inputFile);
       }
     }
 
     long totalTime = System.currentTimeMillis() - startTime;
-    LOG.info("Total " + cnt + " records inserted, " + skipped + " records skipped");
+    LOG.info("Total " + cnt + " records inserted, " + toolarge + " records too large, " + invalidUrls + " invalid URLs, " + errors + " insertion errors.");
     LOG.info("Total time: " + totalTime + "ms");
     LOG.info("Ingest rate: " + cnt / (totalTime / 1000) + " records per second.");
   }
@@ -228,10 +271,13 @@ public class IngestFiles {
     options.addOption(OptionBuilder.withArgName("path").hasArg()
         .withDescription("WARC files location").create(DIR_OPTION));
     options.addOption(OptionBuilder.withArgName("n").hasArg()
-        .withDescription("Start from the n-th WARC file").create(START_OPTION));
+        .withDescription("start from the n-th WARC file").create(START_OPTION));
+    options.addOption(OptionBuilder.withArgName("n").hasArg()
+        .withDescription("max record size to insert (default = 10 MB)").create(MAX_CONTENT_SIZE_OPTION));
 
     options.addOption("create", false, "create new table");
     options.addOption("append", false, "append to existing table");
+    options.addOption(GZ_OPTION, false, "use GZ compression (default = Snappy)");
 
     CommandLine cmdline = null;
     CommandLineParser parser = new GnuParser();
@@ -258,15 +304,32 @@ public class IngestFiles {
 
     String path = cmdline.getOptionValue(DIR_OPTION);
     File inputFolder = new File(path);
+    Compression.Algorithm compression = Compression.Algorithm.SNAPPY;
+    if (cmdline.hasOption(GZ_OPTION)) {
+      compression = Compression.Algorithm.GZ;
+    }
 
     int i = 0;
     if (cmdline.hasOption(START_OPTION)) {
       i = Integer.parseInt(cmdline.getOptionValue(START_OPTION));
     }
 
+    if (cmdline.hasOption(MAX_CONTENT_SIZE_OPTION)) {
+      IngestFiles.MAX_CONTENT_SIZE =
+          Integer.parseInt(cmdline.getOptionValue(MAX_CONTENT_SIZE_OPTION));
+    }
+
     String name = cmdline.getOptionValue(NAME_OPTION);
     boolean create = cmdline.hasOption(CREATE_OPTION);
-    IngestFiles load = new IngestFiles(name, create);
+
+
+    LOG.info("Input: " + inputFolder);
+    LOG.info("Table: " + name);
+    LOG.info("Create new table: " + create);
+    LOG.info("Compression: " + compression);
+    LOG.info("Max content size: " + IngestFiles.MAX_CONTENT_SIZE);
+
+    IngestFiles load = new IngestFiles(name, create, compression);
     load.ingestFolder(inputFolder, i);
   }
 }
