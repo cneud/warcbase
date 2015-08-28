@@ -23,10 +23,29 @@ public class PigArcLoaderTest {
   private File tempDir;
 
   @Test
-  public void testCountLinks() throws Exception {
+  public void testArcLoaderCount() throws Exception {
     String arcTestDataFile = Resources.getResource("arc/example.arc.gz").getPath();
 
-    String pigFile = Resources.getResource("scripts/TestCountLinks.pig").getPath();
+    String pigFile = Resources.getResource("scripts/TestArcLoaderCount.pig").getPath();
+    String location = tempDir.getPath().replaceAll("\\\\", "/"); // make it work on windows
+
+    PigTest test = new PigTest(pigFile, new String[] { "testArcFolder=" + arcTestDataFile,
+        "experimentfolder=" + location });
+
+    Iterator<Tuple> parses = test.getAlias("b");
+
+    Tuple tuple = parses.next();
+    assertEquals(300L, tuple.get(0));
+
+    // There should only be one record.
+    assertFalse(parses.hasNext());
+  }
+
+  @Test
+  public void testArcCountLinks() throws Exception {
+    String arcTestDataFile = Resources.getResource("arc/example.arc.gz").getPath();
+
+    String pigFile = Resources.getResource("scripts/TestArcCountLinks.pig").getPath();
     String location = tempDir.getPath().replaceAll("\\\\", "/"); // make it work on windows
 
     PigTest test = new PigTest(pigFile, new String[] { "testArcFolder=" + arcTestDataFile,
@@ -40,26 +59,6 @@ public class PigArcLoaderTest {
       cnt++;
     }
     assertEquals(664, cnt);
-  }
-
-  @Test
-  public void testArcLoader() throws Exception {
-    String arcTestDataFile = Resources.getResource("arc/example.arc.gz").getPath();
-
-    String pigFile = Resources.getResource("scripts/TestArcLoader.pig").getPath();
-    String location = tempDir.getPath().replaceAll("\\\\", "/"); // make it work on windows
-
-    PigTest test = new PigTest(pigFile, new String[] { "testArcFolder=" + arcTestDataFile,
-        "experimentfolder=" + location });
-
-    Iterator<Tuple> parses = test.getAlias("c");
-
-    Tuple tuple = parses.next();
-    assertEquals("20080430", tuple.get(0));
-    assertEquals(300L, (long) tuple.get(1));
-
-    // There should only be one record.
-    assertFalse(parses.hasNext());
   }
 
   @Test
@@ -148,7 +147,7 @@ public class PigArcLoaderTest {
         case                    "image/jpeg": assertEquals( 18L, (long) t.get(1)); break;
         case                     "text/html": assertEquals(132L, (long) t.get(1)); break;
         case                    "text/plain": assertEquals( 86L, (long) t.get(1)); break;
-        case               "application/xml": assertEquals(  2L, (long) t.get(1)); break;
+        case               "application/xml": assertEquals(  1L, (long) t.get(1)); break;
         case           "application/rss+xml": assertEquals(  9L, (long) t.get(1)); break;
         case         "applicaiton/xhtml+xml": assertEquals(  1L, (long) t.get(1)); break;
         case      "application/octet-stream": assertEquals(  7L, (long) t.get(1)); break;
