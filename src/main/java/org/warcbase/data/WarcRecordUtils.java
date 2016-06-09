@@ -1,22 +1,32 @@
+/*
+ * Warcbase: an open-source platform for managing web archives
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.warcbase.data;
 
-import java.io.BufferedInputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-import org.apache.log4j.Logger;
 import org.apache.commons.httpclient.HttpParser;
-import org.archive.io.ArchiveRecordHeader;
+import org.apache.log4j.Logger;
 import org.archive.io.warc.WARCConstants;
 import org.archive.io.warc.WARCReader;
 import org.archive.io.warc.WARCReaderFactory;
 import org.archive.io.warc.WARCRecord;
+
+import java.io.*;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Utilities for working with {@code WARCRecord}s (from archive.org APIs).
@@ -27,6 +37,13 @@ public class WarcRecordUtils implements WARCConstants {
   // TODO: these methods work fine, but there's a lot of unnecessary buffer copying, which is
   // terrible from a performance perspective.
 
+  /**
+   * Converts raw bytes into an {@code WARCRecord}.
+   *
+   * @param bytes raw bytes
+   * @return parsed {@code WARCRecord}
+   * @throws IOException
+   */
   public static WARCRecord fromBytes(byte[] bytes) throws IOException {
     WARCReader reader = (WARCReader) WARCReaderFactory.get("",
         new BufferedInputStream(new ByteArrayInputStream(bytes)), false);
@@ -37,11 +54,11 @@ public class WarcRecordUtils implements WARCConstants {
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
     DataOutputStream dout = new DataOutputStream(baos);
 
-    dout.write(new String("WARC/0.17\n").getBytes());
+    dout.write("WARC/0.17\n".getBytes());
     for (Map.Entry<String, Object> entry : record.getHeader().getHeaderFields().entrySet()) {
-      dout.write(new String(entry.getKey() + ": " + entry.getValue().toString() + "\n").getBytes());
+      dout.write((entry.getKey() + ": " + entry.getValue().toString() + "\n").getBytes());
     }
-    dout.write(new String("\n").getBytes());
+    dout.write("\n".getBytes());
     record.dump(dout);
 
     return baos.toByteArray();
@@ -92,7 +109,7 @@ public class WarcRecordUtils implements WARCConstants {
    */
   public static byte[] getBodyContent(WARCRecord record) throws IOException {
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    String line = new String(HttpParser.readLine(record, WARC_HEADER_ENCODING));
+    String line = HttpParser.readLine(record, WARC_HEADER_ENCODING);
     if (line == null) {
       return null;
     }
